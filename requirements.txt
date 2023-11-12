@@ -1,0 +1,8 @@
+ipykernel
+openai
+transformers
+bitsandbytes
+accelerate
+scipy
+wandb
+peft
