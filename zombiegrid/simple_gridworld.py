@@ -13,6 +13,24 @@ class Direction(Enum):
     DOWN = 2
     LEFT = 3
 
+class Action(Enum):
+    FORWARD = 0
+    LEFT = 1
+    RIGHT = 2
+    NO_OP = 3
+
+def get_forward_pos(agent_pos, agent_dir):
+    agent_row, agent_col = agent_pos
+    if agent_dir == Direction.UP:
+        agent_row -= 1
+    elif agent_dir == Direction.RIGHT:
+        agent_col += 1
+    elif agent_dir == Direction.DOWN:
+        agent_row += 1
+    elif agent_dir == Direction.LEFT:
+        agent_col -= 1
+    return (agent_row, agent_col)
+
 
 class GridGame(gym.Env):
     """
@@ -76,6 +94,17 @@ class GridGame(gym.Env):
             self.observation_space = spaces.Box(low=0, high=1, shape=(5,), dtype=np.float32)
         elif obs_type == 'image':
             self.observation_space = spaces.Box(low=0, high=1, shape=(self.grid_height, self.grid_width, 3), dtype=np.float32)
+        elif obs_type == 'multi':
+            self.observation_space = spaces.Tuple((
+                spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32),
+                spaces.Dict({
+                    'agent_pos': spaces.Tuple((spaces.Discrete(self.grid_height), spaces.Discrete(self.grid_width))),
+                    'agent_dir': spaces.Discrete(4),
+                    'target_pos': spaces.Tuple((spaces.Discrete(self.grid_height), spaces.Discrete(self.grid_width))),
+                }),
+                spaces.Box(low=0, high=1, shape=(5,), dtype=np.float32),
+                spaces.Box(low=0, high=1, shape=(self.grid_height, self.grid_width, 3), dtype=np.float32),
+            ))
         else:
             raise ValueError(f"Invalid observation type: {obs_type}")
 
@@ -125,7 +154,7 @@ class GridGame(gym.Env):
         self.num_moves = 0
 
         # Return the initial observation
-        return self.get_observation()
+        return self.get_observation(self.obs_type)
     
     def step(self, action):
         """
@@ -142,7 +171,7 @@ class GridGame(gym.Env):
             - dict: Extra information about the step.
         """
         # Map the discrete action to a Direction
-        game_action = Direction(action)
+        game_action = Action(action)
         self.move_agent(game_action)
         
         # Check if the game is over
@@ -152,9 +181,9 @@ class GridGame(gym.Env):
         reward = 1 if done and self.agent_pos == self.target_pos else 0
         
         # Return step information
-        return self.get_observation(), reward, done, {}
+        return self.get_observation(self.obs_type), reward, done, {}
     
-    def get_observation(self):
+    def get_observation(self, obs_type):
         """
         Get the current observation of the game state.
         
@@ -166,16 +195,16 @@ class GridGame(gym.Env):
             return f'({coord[0]}, {coord[1]})'
         dir_str = Direction(self.agent_dir).name.lower()
         
-        if self.obs_type == 'text':
+        if obs_type == 'text':
             return f'The agent is at {format_coord(self.agent_pos)}, facing {dir_str}. The target is at {format_coord(self.target_pos)}.'
-        elif self.obs_type == 'dict':
+        elif obs_type == 'dict':
             return {'agent_pos': self.agent_pos, 'agent_dir': self.agent_dir, 'target_pos': self.target_pos}
-        elif self.obs_type == 'arr':
-            return np.array([self.agent_pos[0], self.agent_pos[1], self.agent_dir, self.target_pos[0], self.target_pos[1]])
-        elif self.obs_type == 'image':
+        elif obs_type == 'arr':
+            return np.array([self.agent_pos[0], self.agent_pos[1], self.agent_dir.value, self.target_pos[0], self.target_pos[1]])
+        elif obs_type == 'image':
             return self.get_image()
         else:
-            raise ValueError(f"Invalid observation type: {self.obs_type}")
+            raise ValueError(f"Invalid observation type: {obs_type}")
     
     def get_image(self):
         arr = np.zeros((self.grid_height, self.grid_width, 3)) - 1
@@ -204,18 +233,13 @@ class GridGame(gym.Env):
             self.viewer = None                   
 
     def move_agent(self, action):
+        starting_dir = self.agent_dir
+        starting_pos = self.agent_pos
         self.num_moves += 1
         
         agent_row, agent_col = self.agent_pos
-        if action == Direction.UP:
-            if self.agent_dir == Direction.UP:
-                agent_row -= 1
-            elif self.agent_dir == Direction.RIGHT:
-                agent_col += 1
-            elif self.agent_dir == Direction.DOWN:
-                agent_row += 1
-            elif self.agent_dir == Direction.LEFT:
-                agent_col -= 1
+        if action == Action.FORWARD:
+            agent_row, agent_col = get_forward_pos(self.agent_pos, self.agent_dir)
                 
             # Agent cannot go outside of grid
             agent_row = max(0, agent_row)
@@ -225,11 +249,12 @@ class GridGame(gym.Env):
             self.agent_pos = (agent_row, agent_col)
             
                 
-        elif action == Direction.RIGHT:
+        elif action == Action.RIGHT:
             self.agent_dir = Direction((self.agent_dir.value + 1) % 4)
                 
-        elif action == Direction.LEFT:
+        elif action == Action.LEFT:
             self.agent_dir = Direction((self.agent_dir.value - 1) % 4)
+        ending_dir = self.agent_dir
 
 
     def print_board(self):
@@ -298,3 +323,79 @@ class GridGame(gym.Env):
         triangle = patches.Polygon(points, closed=True, facecolor='blue')
         ax.add_patch(triangle)
         display(plt.gcf())
+
+
+def oracle(state_dict):
+    agent_pos = state_dict['agent_pos']
+    agent_dir = state_dict['agent_dir']
+    target_pos = state_dict['target_pos']
+    
+    # If the agent is in the target zone, we can stop
+    if agent_pos == target_pos:
+        return Action.NO_OP.value, "We're at the target, so don't move. ACTION = NO_OP"
+    
+    reasoning = 'Remember, the coordinates are (row, col), so (y, x). The origin is the top left.'
+    
+    delta_y = target_pos[0] - agent_pos[0]
+    delta_x = target_pos[1] - agent_pos[1]
+    reasoning += f'We should move {delta_y} in the y direction and {delta_x} in the x direction.'
+    
+    # Figure out which direction moving forward would take us
+    if agent_dir == Direction.UP:
+        delta = -1
+        direction = 'y'
+    elif agent_dir == Direction.DOWN:
+        delta = 1
+        direction = 'y'
+    elif agent_dir == Direction.LEFT:
+        delta = -1
+        direction = 'x'
+    elif agent_dir == Direction.RIGHT:
+        delta = 1
+        direction = 'x'
+    reasoning += f' Moving forward takes us {delta} in the {direction} direction.'
+    
+    # If this is the right direction, take it
+    relevant_direction = delta_x if direction == 'x' else delta_y
+    if np.sign(relevant_direction) == np.sign(delta):
+        reasoning += f" This is the right direction, so let's move forward. ACTION = FORWARD"
+        return Action.FORWARD.value, reasoning
+    
+    # if we're facing exactly the wrong direction, turn around
+    not_relevant_direction = delta_x if direction == 'y' else delta_y
+    if not_relevant_direction == 0:  # No need to move laterally
+        assert np.sign(relevant_direction) == - delta
+        reasoning += f' We are facing the wrong direction, so turn around. ACTION = LEFT'
+        return Action.LEFT.value, reasoning
+    
+    reasoning += f" This is wrong, so we should turn."
+    # Otherwise, turn left or right
+    if agent_dir == Direction.UP:
+        left_dir = '-x'
+        right_dir = '+x'
+    elif agent_dir == Direction.DOWN:
+        left_dir = '+x'
+        right_dir = '-x'
+    elif agent_dir == Direction.LEFT:
+        left_dir = '+y'
+        right_dir = '-y'
+    elif agent_dir == Direction.RIGHT:
+        left_dir = '-y'
+        right_dir = '+y'
+
+    reasoning += f' Turning left lets us travel in the {left_dir} direction, and turning right lets us travel in the {right_dir} direction.'
+    if 'y' in left_dir:
+        dir_str = 'y'
+        relevant_delta = delta_y
+    else:
+        dir_str = 'x'
+        relevant_delta = delta_x
+    sign_str = '+' if relevant_delta > 0 else '-'
+    desired_dir_str = f'{sign_str}{dir_str}'
+    go_left = left_dir == desired_dir_str
+    reasoning += f' We want to travel in the {desired_dir_str} direction,'
+    reasoning += f' so we should turn {"left" if go_left else "right"}. ACTION = {"LEFT" if go_left else "RIGHT"}'
+    return Action.LEFT.value if go_left else Action.RIGHT.value, reasoning
+    
+    
+    

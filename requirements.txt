@@ -6,3 +6,8 @@ accelerate
 scipy
 wandb
 peft
+gym
+
+
+Cython
+trlx
