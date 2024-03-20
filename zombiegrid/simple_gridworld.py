@@ -94,6 +94,10 @@ class GridGame(gym.Env):
             self.observation_space = spaces.Box(low=0, high=1, shape=(5,), dtype=np.float32)
         elif obs_type == 'image':
             self.observation_space = spaces.Box(low=0, high=1, shape=(self.grid_height, self.grid_width, 3), dtype=np.float32)
+        elif obs_type == 'textified_state':
+            self.observation_space = spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32)
+        elif obs_type == 'short_text':
+            self.observation_space = spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32)
         elif obs_type == 'multi':
             self.observation_space = spaces.Tuple((
                 spaces.Box(low=0, high=1, shape=(1,), dtype=np.float32),
@@ -197,12 +201,17 @@ class GridGame(gym.Env):
         
         if obs_type == 'text':
             return f'The agent is at {format_coord(self.agent_pos)}, facing {dir_str}. The target is at {format_coord(self.target_pos)}.'
+        elif obs_type == 'short_text':
+            return f'Agent at {self.agent_pos[0]}, {self.agent_pos[1]} facing {dir_str}. Target at {self.target_pos[0]}, {self.target_pos[1]}.'
         elif obs_type == 'dict':
             return {'agent_pos': self.agent_pos, 'agent_dir': self.agent_dir, 'target_pos': self.target_pos}
         elif obs_type == 'arr':
             return np.array([self.agent_pos[0], self.agent_pos[1], self.agent_dir.value, self.target_pos[0], self.target_pos[1]])
         elif obs_type == 'image':
             return self.get_image()
+        elif obs_type == 'textified_state':
+            arr_state = np.array([self.agent_pos[0], self.agent_pos[1], self.agent_dir.value, self.target_pos[0], self.target_pos[1]])
+            return ' ' + ' '.join(map(str, arr_state.tolist()))
         else:
             raise ValueError(f"Invalid observation type: {obs_type}")
     
@@ -210,6 +219,7 @@ class GridGame(gym.Env):
         arr = np.zeros((self.grid_height, self.grid_width, 3)) - 1
         arr[self.target_pos[0], self.target_pos[1], 1] = 4
         arr[self.agent_pos[0], self.agent_pos[1], 2] = self.agent_dir
+        return arr
         
     
     def render(self, mode='human'):
@@ -233,8 +243,6 @@ class GridGame(gym.Env):
             self.viewer = None                   
 
     def move_agent(self, action):
-        starting_dir = self.agent_dir
-        starting_pos = self.agent_pos
         self.num_moves += 1
         
         agent_row, agent_col = self.agent_pos
@@ -254,7 +262,6 @@ class GridGame(gym.Env):
                 
         elif action == Action.LEFT:
             self.agent_dir = Direction((self.agent_dir.value - 1) % 4)
-        ending_dir = self.agent_dir
 
 
     def print_board(self):
@@ -301,7 +308,7 @@ class GridGame(gym.Env):
     def print_board_image(self):
         plt.close()
         clear_output(wait=True)
-        fig, ax = plt.subplots(figsize=(10,10))
+        fig, ax = plt.subplots(figsize=(3,3))
         ax.set_xlim(0, self.grid_width)
         ax.set_ylim(0, self.grid_height)
         ax.set_xticks(range(self.grid_width + 1))
@@ -309,7 +316,7 @@ class GridGame(gym.Env):
         ax.grid(which='both')
 
         # Add a colored patch for the target zone
-        ax.add_patch(patches.Rectangle((self.target_col, self.grid_height-self.target_row-1), 1, 1, facecolor='green'))
+        ax.add_patch(patches.Rectangle((self.target_pos[1], self.grid_height-self.target_pos[0]-1), 1, 1, facecolor='green'))
 
         i, j = self.agent_pos
         if self.agent_dir == Direction.UP:
@@ -332,13 +339,18 @@ def oracle(state_dict):
     
     # If the agent is in the target zone, we can stop
     if agent_pos == target_pos:
-        return Action.NO_OP.value, "We're at the target, so don't move. ACTION = NO_OP"
+        long_reasoning = " We're at the target, so don't move. ACTION = NO_OP"
+        short_reasoning = ' At target. ACTION = NO_OP'
+        action_only_reasoning = ' ACTION = NO_OP'
+        return Action.NO_OP.value, {'long_reasoning': long_reasoning, 'short_reasoning': short_reasoning, 'action_only_reasoning': action_only_reasoning}
     
-    reasoning = 'Remember, the coordinates are (row, col), so (y, x). The origin is the top left.'
+    reasoning = ' Remember, the coordinates are (row, col), so (y, x). The origin is the top left.'
+    short_reasoning = ''
     
     delta_y = target_pos[0] - agent_pos[0]
     delta_x = target_pos[1] - agent_pos[1]
-    reasoning += f'We should move {delta_y} in the y direction and {delta_x} in the x direction.'
+    reasoning += f' We should move {delta_y} in the y direction and {delta_x} in the x direction.'
+    short_reasoning += f' Distance to target: {delta_y}, {delta_x}.'
     
     # Figure out which direction moving forward would take us
     if agent_dir == Direction.UP:
@@ -359,14 +371,16 @@ def oracle(state_dict):
     relevant_direction = delta_x if direction == 'x' else delta_y
     if np.sign(relevant_direction) == np.sign(delta):
         reasoning += f" This is the right direction, so let's move forward. ACTION = FORWARD"
-        return Action.FORWARD.value, reasoning
+        short_reasoning += f' Move forward. ACTION = FORWARD'
+        return Action.FORWARD.value, {'long_reasoning': reasoning, 'short_reasoning': short_reasoning, 'action_only_reasoning': ' ACTION = FORWARD'}
     
     # if we're facing exactly the wrong direction, turn around
     not_relevant_direction = delta_x if direction == 'y' else delta_y
     if not_relevant_direction == 0:  # No need to move laterally
         assert np.sign(relevant_direction) == - delta
         reasoning += f' We are facing the wrong direction, so turn around. ACTION = LEFT'
-        return Action.LEFT.value, reasoning
+        short_reasoning += f' Turn around. ACTION = LEFT'
+        return Action.LEFT.value, {'long_reasoning': reasoning, 'short_reasoning': short_reasoning, 'action_only_reasoning': ' ACTION = LEFT'}
     
     reasoning += f" This is wrong, so we should turn."
     # Otherwise, turn left or right
@@ -395,7 +409,9 @@ def oracle(state_dict):
     go_left = left_dir == desired_dir_str
     reasoning += f' We want to travel in the {desired_dir_str} direction,'
     reasoning += f' so we should turn {"left" if go_left else "right"}. ACTION = {"LEFT" if go_left else "RIGHT"}'
-    return Action.LEFT.value if go_left else Action.RIGHT.value, reasoning
+    short_reasoning += f' Head {desired_dir_str}. ACTION = {"LEFT" if go_left else "RIGHT"}.'
+    action_only_reasoning = f' ACTION = {"LEFT" if go_left else "RIGHT"}'
+    return Action.LEFT.value if go_left else Action.RIGHT.value, {'long_reasoning': reasoning, 'short_reasoning': short_reasoning, 'action_only_reasoning': action_only_reasoning}
     
     
     

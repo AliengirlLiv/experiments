@@ -7,6 +7,8 @@ scipy
 wandb
 peft
 gym
+anthropic
+python-dotenv
 
 
 Cython

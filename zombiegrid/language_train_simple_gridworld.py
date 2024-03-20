@@ -13,12 +13,16 @@ from simple_gridworld import GridGame, oracle, Action
 from torch.utils.data import DataLoader
 from transformers.integrations import WandbCallback
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
-from transformers import pipeline
+from trl import SFTTrainer, DataCollatorForCompletionOnlyLM
+from datasets import Dataset
+import wandb
 
-os.environ['WANDB_PROJECT'] = 'language-agents'
+wandb_project = 'language-agents'
+os.environ['WANDB_PROJECT'] = wandb_project
+# Disable the wandb logging
+# os.environ['WANDB_DISABLED'] = 'true'
 
-DEBUG = True
+DEBUG = False
 
 from transformers import (
     AutoTokenizer,
@@ -58,32 +62,6 @@ def printc(text, color):
     print(f"{colors[color]}{text}\033[0m")
 
 
-def load_model_and_tokenizer(
-    model_id="mistralai/Mistral-7B-Instruct-v0.1", quantization_config=None
-):
-    """
-    Load the model and tokenizer.
-
-    Parameters:
-    model_id (str): Identifier for the model to be loaded.
-    quantization_config (transformers.QuantizationConfig): Configuration for model quantization.
-
-    Returns:
-    transformers.AutoModelForCausalLM: The loaded model.
-    transformers.AutoTokenizer: The loaded tokenizer.
-    """
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        trust_remote_code=True,
-        quantization_config=quantization_config,
-        device_map={'':torch.cuda.current_device()}
-    )
-    print('CURRENT DEVICE', torch.cuda.current_device())
-    print(f"Loaded model! Now loading tokenizer")
-    tokenizer = AutoTokenizer.from_pretrained(model_id, padding_side="left")
-    tokenizer.pad_token = tokenizer.eos_token
-    return model, tokenizer
-
 
 def load_four_bit_lora(model_name="mistralai/Mistral-7B-v0.1"):
     """
@@ -103,8 +81,10 @@ def load_four_bit_lora(model_name="mistralai/Mistral-7B-v0.1"):
         bnb_4bit_compute_dtype=torch.float16,
     )
     print(f"Loading model, this might take a while: {model_name}")
-    model, tokenizer = load_model_and_tokenizer(
-        model_name, quantization_config=bnb_config
+    model = AutoModelForCausalLM.from_pretrained(
+        model_name,
+        device_map="auto",
+        quantization_config=bnb_config,
     )
     model = prepare_model_for_kbit_training(model)
 
@@ -127,20 +107,25 @@ def load_four_bit_lora(model_name="mistralai/Mistral-7B-v0.1"):
     else:
         raise NotImplementedError(f"Model {model_name} not supported; please add a lora config for it")    
 
+    lora_args = {'rank': 16, 'alpha': 32, 'bias': 'none', 'dropout': 0.05}
     config = LoraConfig(
-        r=16,
-        lora_alpha=32,
+        r=lora_args['rank'],
+        lora_alpha=lora_args['alpha'],
         # modules suggested here
         # https://github.com/brevdev/notebooks/blob/main/mistral-finetune.ipynb
         target_modules=target_modules,
-        bias="none",
-        lora_dropout=0.05,
+        bias=lora_args['bias'],
+        lora_dropout=lora_args['dropout'],
         task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, config)
     model.print_trainable_parameters()
+    
+    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer.add_special_tokens({'pad_token': '?'})
+    tokenizer.padding_side = 'right'
 
-    return model, tokenizer
+    return model, tokenizer, lora_args
 
 
 
@@ -151,14 +136,14 @@ The agent's goal is to reach the target.
 The agent's position and the target's position are represented by coordinates (row, column), where the top left corner is (0, 0).
 Choose the agent's next action. Output your action as a string "ACTION = <action>".
 """
-    return f"{prompt}{state}{completion}"
+    return f"{prompt} {state}\n Answer:", completion
 
 def short_prompt(state, completion):
     prompt = """Go to target using FORWARD, LEFT, and RIGHT. Coords are (row, column), with origin top left. Output "ACTION = <action>"."""
-    return f"{prompt}{state}{completion}"
+    return f"{prompt} {state}\n Answer:", completion
     
 def null_prompt(state, completion):
-    return f"{state}{completion}"
+    return state, completion
 
 PROMPT_TEMPLATE_DICT = {
     "long": long_prompt,
@@ -176,6 +161,14 @@ def format_dataset(data_path, tokenizer, prompt_template, max_length=None):
     # Load demos from pkl file
     with open(data_path, "rb") as f:
         demos = pkl.load(f)
+    # Remove 90% of the no-ops
+    new_demos = []
+    for state, completion in demos:
+        if np.random.uniform() < .9 and 'NO_OP' in completion:
+            continue
+        new_demos.append((state, completion))
+    demos = new_demos
+
     if max_length is not None:
         demos = demos[:max_length]
     global DEBUG
@@ -184,116 +177,98 @@ def format_dataset(data_path, tokenizer, prompt_template, max_length=None):
     formatted_demos = []
     eos = tokenizer.eos_token
     for state, completion in demos:
+        prompt_only, completion_only = prompt_template(state, f"{completion}{eos}")
         formatted_demos.append(
             {
-                "text": f"{prompt_template(state, completion)}{eos}",
+                "prompt_and_completion": prompt_only + completion_only,
+                "prompt": prompt_only,
+                "completion": completion_only,
             }
         )
-    # Make a dataset
     dataset = Dataset.from_list(formatted_demos)
-    # Tokenize the dataset
-    dataset = dataset.map(
-        lambda sample: tokenizer(sample["text"]),
-        batched=True,
-        batch_size=10,
-    )
     return dataset
 
 
-def generate_sequence(input_str, model, tokenizer, max_length=150):
-
-    # Convert input tokens to PyTorch tensor
-    input_tokens = tokenizer(input_str, return_tensors="pt")
-
-    # Generate sequence
-    output_sequence = input_tokens
-    for _ in range(max_length):
-        outputs = model(output_sequence)
-        predictions = outputs.logits
-
-        # Get the index of the token with the highest probability
-        next_token = torch.argmax(predictions[:, -1, :], dim=-1)
-
-        # Append the predicted token to the sequence
-        output_sequence = torch.cat((output_sequence, next_token.unsqueeze(0)), dim=1)
-
-        # Check for end of sequence token
-        if next_token.item() == tokenizer.eos_token_id:
-            break
-
-    return output_sequence[0].tolist()
-
-
-
-def generate_text(input_text, generator, max_length):
-
-    # Generate text
-    generated_text = generator(input_text, max_new_tokens=max_length, do_sample=True, return_full_text=False)
-
-    return generated_text[0]['generated_text']
-
-
 class CustomEval(WandbCallback):
-    def __init__(self, eval_name, eval_dataset, eval_env, generator, tokenizer, num_eval_rollouts=1, generator_max_length=150, reasoning_key=''):
+    def __init__(self, eval_name, eval_dataset, eval_env, tokenizer, num_eval_rollouts=1, generator_max_length=150, reasoning_key='', batch_size=16):
         super().__init__()
         self.eval_name = eval_name
         self.eval_dataset = eval_dataset
         self.eval_env = eval_env
-        self.generator = generator
         self.tokenizer = tokenizer
         self.num_eval_rollouts = num_eval_rollouts
         self.generator_max_length = generator_max_length
         self.reasoning_key = reasoning_key
+        self.batch_size = batch_size
         
     def on_evaluate(self, args, state, control, **kwargs):
         model = kwargs["model"]
         model.eval()  # Set the model to evaluation mode
-    
         
         # First compute the per-token eval accuracy
-        eval_loss = 0
-        eval_acc = 0
-        eval_all_correct = 0
-        eval_samples = 0
-        device = torch.device(f'cuda:{torch.cuda.current_device()}' if torch.cuda.is_available() else "cpu")
-        for batch in self.eval_dataset:
-            import pdb; pdb.set_trace()
-            # Get the model output
-            input_ids = torch.stack(batch['input_ids']).to(device)
-            attention_mask = torch.stack(batch['attention_mask']).to(device)
+        per_token_accuracies = []
+        exact_match_accuracies = []
+        eval_losses = []
+        with torch.no_grad():
+            for i in range(0, len(self.eval_dataset), self.batch_size):
+                batch = self.eval_dataset[i:i+self.batch_size]
+                inputs_and_targets = batch["prompt_and_completion"]
+                targets = batch["completion"]
+                no_op_count = 0
+                for t in targets:
+                    if t.strip().startswith('Move forward.'):
+                        printc(f'WEIRDNESS!!!!!!!!! {t}', 'yellow')
+                        import pdb; pdb.set_trace()
+                    no_op_count += 'NO_OP' in t
+                print(f'FRAC NO-OP {no_op_count / len(targets)}')
 
-            with torch.no_grad():
-                outputs = model(input_ids=input_ids, attention_mask=attention_mask)
-            # Switch from (b, s, v) to (b, v, s)
-            logits = torch.transpose(outputs.logits[:-1], 1, 2)
-            targets = input_ids[1:].contiguous()  # This contains a bunch of pad tokens, SOS, then contents
-            # Don't include pad tokens in the loss
-            pad_token_id = self.tokenizer.pad_token_id
-            mask = (input_ids != pad_token_id)[:-1]  # (s, b)
-            loss_vector = torch.nn.functional.cross_entropy(
-                logits, targets, reduction="none"
-            )
-            # Mask out the pad tokens
-            loss_vector = loss_vector * mask
-            # Average over the non-pad tokens
-            loss = torch.sum(loss_vector) / torch.sum(mask)
-            
-            # Compute the loss
-            num_points = len(batch["input_ids"])
-            eval_loss += loss.item()
-            # Compute the per-token accuracy
-            preds = torch.argmax(logits, dim=1)
-            correct_preds = (preds == targets).float() * mask.float()
-            eval_acc += torch.sum(correct_preds).item() / torch.sum(mask).item() * num_points
-            eval_all_correct += (correct_preds.sum(1) == mask.sum(1)).sum().item()
-            eval_samples += num_points
-            
-        input_text = self.tokenizer.decode(input_ids[0])
-        print(f'First row of input ids: {batch["input_ids"][0]}')
-        printc(f'Eval input tokens: {input_ids[0]}', 'cyan')
-        printc(f'Eval input text: {input_text}', 'green')
-        printc(f'Eval loss: {eval_loss / eval_samples}; Eval acc: {eval_acc / eval_samples}, Eval all correct: {eval_all_correct / eval_samples}', 'red')
-        
+                # Generate predictions
+                input_ids = self.tokenizer(inputs_and_targets, return_tensors="pt", padding='longest')
+                target_ids = self.tokenizer(targets, return_tensors="pt", padding='longest')
+                # Move to device
+                input_ids = {k: v.to(model.device) for k, v in input_ids.items()}
+                target_ids = {k: v.to(model.device) for k, v in target_ids.items()}
+                
+                # we need to define a mask for the target_ids within the input_ids
+                # Count the number of padding tokens in each input
+                padding_tokens_input = (input_ids['attention_mask'] == 0).sum(dim=1)
+                non_padding_tokens_target = (target_ids['attention_mask'] == 1).sum(dim=1)
+                # The target ids are the last non-padding tokens in the input_ids
+                target_id_mask = torch.zeros_like(input_ids['attention_mask'])
+                # in each row of the input, we have [input_tokens][target_tokens][padding_tokens]
+                B, T = input_ids['input_ids'].shape
+                for i in range(B):
+                    end_idx = T - padding_tokens_input[i] - 1  # last non-masked input token
+                    # we keep every target token plus the last token of the prompt (which corresponds to predicting the first target token)
+                    start_idx = end_idx - non_padding_tokens_target[i] - 1
+                    target_id_mask[i, start_idx:end_idx] = 1
+                # Make the full target ids by shifting the input ids over 1 and adding the eos token on the end
+                full_target_ids = torch.cat([input_ids['input_ids'][:, 1:], torch.ones((B, 1), dtype=torch.long).to(model.device) * self.tokenizer.pad_token_id], dim=1)
+
+                logits = model(input_ids=input_ids['input_ids'], attention_mask=input_ids['attention_mask']).logits
+                # Cross-entropy loss
+                loss = torch.nn.functional.cross_entropy(logits.view(-1, logits.shape[-1]), full_target_ids.view(-1), ignore_index=self.tokenizer.pad_token_id)
+                eval_losses.append(loss.item())
+                
+                pred_tokens = logits.argmax(dim=-1)
+
+                # (a) Calculate per-token accuracy within mask
+                correct_tokens = (pred_tokens == full_target_ids).float() * target_id_mask
+                per_token_accuracy = correct_tokens.sum() / target_id_mask.sum()
+                per_token_accuracies.append(per_token_accuracy.item())
+
+                # (b) Calculate exact-match accuracy
+                # First, make the padding tokens 0
+                pred_tokens = pred_tokens * target_id_mask
+                target_tokens = full_target_ids * target_id_mask
+                exact_matches = (pred_tokens == target_tokens).all(dim=-1)
+                total_items = len(exact_matches)
+                exact_match_accuracy = exact_matches.sum() / total_items
+                exact_match_accuracies.append(exact_match_accuracy.item())
+
+        printc(f'Eval input tokens: {input_ids["input_ids"][0]}', 'cyan')
+        printc(f'Eval input text: {batch["prompt_and_completion"][0]}', 'green')
+        printc(f'Eval loss: {np.mean(eval_losses)}; Eval acc: {np.mean(per_token_accuracies)}; Eval exact match: {np.mean(exact_match_accuracies)}', 'red')     
         
         # Next, do rollouts to compute the success rate
         success_rate = 0
@@ -312,7 +287,11 @@ class CustomEval(WandbCallback):
             generations.append(state)
             while not done:
                 start_time = time.time()
-                generated_text = generate_text(state, self.generator, self.generator_max_length)
+                inputs = self.tokenizer(state, return_tensors="pt")
+                generated_tokens = model.generate(**inputs, max_new_tokens=self.generator_max_length, do_sample=False)
+                generated_completion_tokens = generated_tokens[0, inputs['input_ids'].shape[1]:]
+                generated_text = self.tokenizer.decode(generated_completion_tokens, skip_special_tokens=True)
+                full_generated_text = self.tokenizer.decode(generated_tokens[0], skip_special_tokens=True)
                 generations.append(generated_text)
                 generation_time = time.time() - start_time
                 start_time = time.time()
@@ -327,7 +306,8 @@ class CustomEval(WandbCallback):
                         printc(f'Agent is stuck at state {state}; terminating early', 'red')
                         break
                 oracle_action, oracle_reasoning_dict = oracle(dict_state)
-                if dict_state['agent_pos'] == dict_state['target_pos'] and not oracle_action == Action.NO_OP.value:
+                oracle_action = Action(oracle_action)
+                if dict_state['agent_pos'] == dict_state['target_pos'] and not oracle_action == Action.NO_OP:
                     import pdb; pdb.set_trace()
                 oracle_reasoning = oracle_reasoning_dict[self.reasoning_key]
                 try:
@@ -336,7 +316,7 @@ class CustomEval(WandbCallback):
                     correct_format = True
                     parsed_action = Action[parsed_action]
                 except Exception as e:
-                    parsed_action = 3
+                    parsed_action = Action.NO_OP
                     correct_format = False                    
                 action_success_rate += int(correct_format) * int(parsed_action == oracle_action)
                 reasoning_success_rate += int(generated_text == oracle_reasoning)
@@ -355,6 +335,7 @@ class CustomEval(WandbCallback):
                 printc(f'Action: {parsed_action}, oracle action: {oracle_action}, Reward: {rew}; state: {old_state}', 'blue')
                 printc(f'Success rates: action {action_success_rate / total_actions}; reasoning {reasoning_success_rate / total_actions}', 'magenta')
                 printc(f'reasoning + action:        |{generated_text}|', 'green')
+                print(f'Full reasoning + action:    |{full_generated_text}|', 'red')
                 printc(f'oracle reasoning + action: |{oracle_reasoning}|', 'yellow')
                 step_idx += 1
             # Update the success rate
@@ -369,8 +350,9 @@ class CustomEval(WandbCallback):
         reasoning_success_rate /= total_actions
         # Log the metrics
         metrics = {
-            f"{self.eval_name}/eval_loss": eval_loss / eval_samples,
-            f"{self.eval_name}/eval_acc": eval_acc / eval_samples,
+            f"{self.eval_name}/eval_loss": np.mean(eval_losses),
+            f"{self.eval_name}/eval_acc": np.mean(per_token_accuracies),
+            f"{self.eval_name}/eval_exact_match": np.mean(exact_match_accuracies),
             f"{self.eval_name}/eval_success_rate": success_rate,
             f"{self.eval_name}/eval_action_success_rate": action_success_rate,
             f"{self.eval_name}/eval_reasoning_success_rate": reasoning_success_rate,
@@ -407,13 +389,9 @@ def main():
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-    # model_name = "mistralai/Mistral-7B-Instruct-v0.1"
-    model_name = 'gpt2'
-    model, tokenizer = load_four_bit_lora(model_name)
-    
-    
-    # Initialize a pipeline for text generation
-    generator = pipeline("text-generation", model=model, tokenizer=tokenizer)
+    model_name = "mistralai/Mistral-7B-Instruct-v0.1"
+    # model_name = 'gpt2'
+    model, tokenizer, lora_args = load_four_bit_lora(model_name)
 
     print(f"Now loading data")
     train_dataset = format_dataset(
@@ -421,7 +399,14 @@ def main():
         tokenizer=tokenizer,
         prompt_template=prompt_template,
     )
-    print("Example Input\n", train_dataset[0]["text"])
+    no_op_count = 0
+    for t in train_dataset['completion']:
+        if t.startswith('Move forward.'):
+            printc(f'WEIRDNESS!!!!!!!!! {t}', 'yellow')
+            import pdb; pdb.set_trace()
+        no_op_count += 'NO_OP' in t
+    print(f'FRAC NO-OP {no_op_count / len(train_dataset["completion"])}')
+    print("Example Input\n", train_dataset[0]["prompt_and_completion"])
     num_val_points = 200
     val_dataset = format_dataset(
         data_path=pathlib.Path(args.data_path) / f"val_demos/demos_{args.demo_type}.pkl",
@@ -438,25 +423,6 @@ def main():
     )
     print(f'Dataset lengths: train {len(train_dataset)}, val {len(val_dataset)}, ood {len(ood_dataset)}')
 
-    # tokenize and chunk dataset
-    # lm_train_dataset = train_dataset.map(
-    #     lambda sample: tokenizer(sample["text"], padding="longest"),
-    #     batched=True,
-    #     batch_size=args.batch_size,
-    # )
-    lm_val_dataset = val_dataset.map(
-        lambda sample: tokenizer(sample["text"], padding="longest"),
-        batched=True,
-        batch_size=args.batch_size,
-    )
-    lm_ood_dataset = ood_dataset.map(
-        lambda sample: tokenizer(sample["text"], padding="longest"),
-        batched=True,
-        batch_size=args.batch_size,
-    )
-    import pdb; pdb.set_trace()
-    lm_val_dataloader = DataLoader(lm_val_dataset, batch_size=args.batch_size)
-    lm_ood_dataloader = DataLoader(lm_ood_dataset, batch_size=args.batch_size)
     accept_top_target_fn = lambda coord: coord[0] < 5
     accept_bottom_target_fn = lambda coord: coord[0] >= 5
     
@@ -472,9 +438,9 @@ def main():
     eval_env = GridGame(obs_type=obs_type, target_start_accept_fn=accept_top_target_fn)
 
     # Print total number of samples
-    print(f"Total number of train samples: {len(lm_train_dataset)}")
-    print(f'Val samples: {len(lm_val_dataset)}')
-    print(f'OOD samples: {len(lm_ood_dataset)}')
+    print(f"Total number of train samples: {len(train_dataset)}")
+    print(f'Val samples: {len(val_dataset)}')
+    print(f'OOD samples: {len(ood_dataset)}')
     print(f"Now training")
 
     base_logging_dir = pathlib.Path("logs")
@@ -502,12 +468,17 @@ def main():
         generator_max_length = 75
         reasoning_key = 'long_reasoning'
 
+    response_template = "\n Answer:"
+    response_template_ids = tokenizer.encode(response_template, add_special_tokens=False)[2:]
+    collator = DataCollatorForCompletionOnlyLM(response_template_ids, tokenizer=tokenizer)
 
-    trainer = Trainer(
+    trainer = SFTTrainer(
         model=model,
-        train_dataset=lm_train_dataset,
-        eval_dataset=lm_val_dataset,
         tokenizer=tokenizer,
+        train_dataset=train_dataset,
+        eval_dataset=val_dataset,
+        # Use the prompt_and_completion as the input
+        dataset_text_field="prompt_and_completion",
         args=TrainingArguments(
             per_device_train_batch_size=args.batch_size,
             per_device_eval_batch_size=args.batch_size,
@@ -515,11 +486,10 @@ def main():
             logging_steps=5,
             num_train_epochs=args.num_epochs,
             learning_rate=args.lr,
-            bf16=False,
             save_strategy="steps",
             save_steps=args.save_steps,
             output_dir=exp_output_dir,
-            report_to="wandb",  # could also use wandb
+            report_to="wandb",
             evaluation_strategy="steps",
             eval_steps=args.eval_every_steps,
             local_rank=os.getenv("LOCAL_RANK", -1),
@@ -530,17 +500,20 @@ def main():
             load_best_model_at_end=True,
             metric_for_best_model="eval_loss",
             save_total_limit=1,
+            gradient_accumulation_steps=4,
         ),
-        data_collator=DataCollatorForLanguageModeling(tokenizer, mlm=False),
-        callbacks=[CustomEval("val", lm_val_dataloader, eval_env, generator, tokenizer, generator_max_length=generator_max_length, reasoning_key=reasoning_key),
-                   CustomEval("ood", lm_ood_dataloader, ood_env, generator, tokenizer, generator_max_length=generator_max_length, reasoning_key=reasoning_key)],
+        data_collator=collator,
+        callbacks=[CustomEval("val", val_dataset, eval_env, tokenizer, generator_max_length=generator_max_length, reasoning_key=reasoning_key, batch_size=args.batch_size),
+                   CustomEval("ood", ood_dataset, ood_env, tokenizer, generator_max_length=generator_max_length, reasoning_key=reasoning_key, batch_size=args.batch_size),
+        ],
     )
-    model.config.use_cache = (
-        False  # silence the warnings. Please re-enable for inference!
-    )
+    full_args = {**trainer.args.to_dict(), **lora_args}
+    wandb.init(project=wandb_project, name=args.exp_name, config=full_args)
+
 
     trainer.train()
 
 
 if __name__ == "__main__":
     main()
+    print("Finished training")

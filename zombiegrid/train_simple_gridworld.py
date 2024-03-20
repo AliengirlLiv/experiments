@@ -2,7 +2,7 @@ import gym
 import torch
 import torch.nn as nn
 import torch.optim as optim
-# import wandb
+import wandb
 import random
 import pickle
 from simple_gridworld import GridGame, oracle
@@ -13,6 +13,9 @@ import numpy as np
 # Step 1: Collect Demos
 def collect_demos(env, num_episodes=10000, save_dir='demos'):
     demos_state = []
+    demos_state_only_text = []
+    demos_short_text_reasoning = []
+    demos_short_text_no_reasoning = []
     demos_text = []
     demos_dict = []
     
@@ -25,11 +28,19 @@ def collect_demos(env, num_episodes=10000, save_dir='demos'):
         while not done:
             dict_state = env.get_observation('dict')
             text_state = env.get_observation('text')
-            action, reasoning = oracle(dict_state)
+            textified_state = env.get_observation('textified_state')
+            short_text_state = env.get_observation('short_text')
+            action, reasoning_dict = oracle(dict_state)
+            long_reasoning = reasoning_dict['long_reasoning']
+            short_reasoning = reasoning_dict['short_reasoning']
+            action_only_reasoning = reasoning_dict['action_only_reasoning']
             next_state, reward, done, _ = env.step(action)
-            demos_dict.append((arr_state, action))
+            demos_dict.append((dict_state, action))
             demos_state.append((arr_state, action))
-            demos_text.append((text_state, reasoning))
+            demos_state_only_text.append((textified_state, action_only_reasoning))
+            demos_short_text_reasoning.append((short_text_state, short_reasoning))
+            demos_short_text_no_reasoning.append((short_text_state, action_only_reasoning))
+            demos_text.append((text_state, long_reasoning))
             arr_state = next_state
         if not reward == 1:
             import pdb; pdb.set_trace()
@@ -41,6 +52,12 @@ def collect_demos(env, num_episodes=10000, save_dir='demos'):
         pickle.dump(demos_text, f)
     with open(save_dir / 'demos_dict.pkl', 'wb') as f:
         pickle.dump(demos_dict, f)
+    with open(save_dir / 'demos_state_only_text.pkl', 'wb') as f:
+        pickle.dump(demos_state_only_text, f)
+    with open(save_dir / 'demos_short_text_reasoning.pkl', 'wb') as f:
+        pickle.dump(demos_short_text_reasoning, f)
+    with open(save_dir / 'demos_short_text_no_reasoning.pkl', 'wb') as f:
+        pickle.dump(demos_short_text_no_reasoning, f)
     return demos_state
 
 # Step 2: MLP Policy with 3 Layers
@@ -63,7 +80,7 @@ def eval(env, model, val_demos):
     with torch.no_grad():
         val_loss = 0
         for state, action in val_demos:
-            state = torch.tensor([state], dtype=torch.float32).to(device)
+            state = torch.tensor(np.array([state]), dtype=torch.float32).to(device)
             action = torch.tensor([action], dtype=torch.long).to(device)
             output = model(state)
             loss = criterion(output, action)
@@ -86,7 +103,7 @@ def eval(env, model, val_demos):
 def train(model, optimizer, criterion, train_demos, val_demos, ood_demos, env, epochs=1, batch_size=512, eval_interval=100):
     
     # Initialize wandb
-    # wandb.init(project="language-agents")
+    wandb.init(project="language-agents")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     for epoch in range(epochs):
         total_loss = 0
@@ -95,6 +112,7 @@ def train(model, optimizer, criterion, train_demos, val_demos, ood_demos, env, e
         
         # shuffle demos
         random.shuffle(train_demos)
+        train_loss_list = []
         
         for i in range(0, len(train_demos), batch_size):
             batch = train_demos[i:i+batch_size]
@@ -106,26 +124,29 @@ def train(model, optimizer, criterion, train_demos, val_demos, ood_demos, env, e
             outputs = model(states)
             loss = criterion(outputs, actions)
             loss.backward()
+            train_loss_list.append(loss.item())
             optimizer.step()
 
             total_loss += loss.item()
         
-        # wandb.log({"train_loss": total_loss / len(train_demos)})
-        print(f"Epoch {epoch} loss: {total_loss / len(train_demos)}")
+            if i % batch_size * 100 == 99:
+                wandb.log({"train_loss": sum(train_loss_list) / len(train_loss_list)})
+            print(f"Epoch {epoch} batch {i} loss: {total_loss / len(train_demos)}")
 
-        # Validation
-        if epoch % eval_interval == 0:
-            model.eval()
-            val_loss, val_reward = eval(env, model, val_demos)
-            # wandb.log({"val_loss": val_loss / len(val_demos)})
-            print(f"Epoch {epoch} val loss: {val_loss / len(val_demos)}")
-            # wandb.log({"eval_reward": total_reward})
-            print(f"Epoch {epoch} eval reward: {val_reward}")
-            ood_val_loss, ood_val_reward = eval(ood_env, model, ood_demos)
-            # wandb.log({"val_loss": val_loss / len(val_demos)})
-            print(f"Epoch {epoch} val loss: {ood_val_loss / len(ood_demos)}")
-            # wandb.log({"ood_eval_reward": ood_val_reward})
-            print(f"Epoch {epoch} eval reward: {ood_val_reward}")
+            # Validation
+            if epoch % eval_interval == 0:
+                model.eval()
+                val_loss, val_reward = eval(env, model, val_demos)
+                wandb.log({"val_loss": val_loss / len(val_demos)})
+                print(f"Epoch {epoch} val loss: {val_loss / len(val_demos)}")
+                wandb.log({"val_reward": val_reward})
+                print(f"Epoch {epoch} eval reward: {val_reward}")
+                
+                ood_val_loss, ood_val_reward = eval(ood_env, model, ood_demos)
+                wandb.log({"ood_val_loss": ood_val_loss / len(ood_demos)})
+                print(f"Epoch {epoch} ood val loss: {ood_val_loss / len(ood_demos)}")
+                wandb.log({"ood_eval_reward": ood_val_reward})
+                print(f"Epoch {epoch} ood eval reward: {ood_val_reward}")
 
 # Save demos and model
 def save_model(model, filename):
@@ -145,11 +166,12 @@ if __name__ == "__main__":
     optimizer = optim.Adam(model.parameters(), lr=0.001)
     criterion = nn.CrossEntropyLoss()
 
-    train_demos = collect_demos(env, num_episodes=10000)
+    train_demos = collect_demos(env, num_episodes=10000, save_dir='train_demos')
+    print('TRAIN DEMOS LEN', len(train_demos))
     random.shuffle(train_demos)
-    val_demos = collect_demos(env, num_episodes=100)
+    val_demos = collect_demos(env, num_episodes=100, save_dir='val_demos')
     ood_env = GridGame(obs_type='arr', target_start_accept_fn=accept_bottom_target_fn)
-    ood_demos = collect_demos(ood_env, num_episodes=100)
+    ood_demos = collect_demos(ood_env, num_episodes=100, save_dir='ood_demos')
 
     train(model, optimizer, criterion, train_demos, val_demos, ood_demos, env)
 
