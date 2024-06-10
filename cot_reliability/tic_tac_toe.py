@@ -388,22 +388,22 @@ b1=o, b2=o, b3=_
 c1=_, c2=_, c3=_
 I have pieces in a1 and a2. Cell a3 is open, so I can play there to win with (a1, a2, a3). My answer is \\action{a3}.
 
-ax=_, a2=_, a3=x
+a1=_, a2=_, a3=x
 b1=o, b2=_ b3=o
 c1=x, c2=o, c3=x
 I have pieces in a3, c1, and c3. Cell b2 is open, so I can play there to win with (a3, b2, c1). My answer is \\action{b2}.
 
-ax=o, a2=x, a3=_
+a1=o, a2=x, a3=_
 b1=o, b2=o, b3=x
 c1=x, c2=o, c3=x
 I have pieces in a2, b3, c1, and c3. Cell a3 is open, so I can play there to win with (a3, b3, c3). My answer is \\action{a3}.
 
-ax=_, a2=_, a3=_
+a1=_, a2=_, a3=_
 b1=o, b2=x, b3=_
 c1=_, c2=x, c3=o
 I have pieces in b2 and c2. Cell a2 is open, so I can play there to win with (a2, b2, c2). My answer is \\action{a2}.
 
-ax=o, a2=o, a3=_
+a1=o, a2=o, a3=_
 b1=_, b2=x, b3=o
 c1=x, c2=_, c3=x
 I have pieces in b2, c1, and c3. Cell c2 is open, so I can play there to win with (c1, c2, c3). My answer is \\action{c2}.
